@@ -1,0 +1,136 @@
+on: [push, pull_request]
+
+name: GNU Compatibility Tests
+
+jobs:
+  gnu-tests:
+    permissions:
+      actions: read
+
+    name: Run GNU tar tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout uutils tar
+        uses: actions/checkout@v6
+        with:
+          path: tar
+
+      - name: Checkout GNU tar
+        uses: actions/checkout@v6
+        with:
+          repository: gnu-mirror-unofficial/tar
+          path: tar.gnu
+          ref: de72aa0cd63a6bb5d206227a609ff113e5b26171
+          submodules: false
+
+      - name: Override submodule URLs and initialize submodules
+        # Use GitHub mirrors instead of upstream git servers
+        run: |
+          git config submodule.gnulib.url https://github.com/coreutils/gnulib.git
+          git config submodule.paxutils.url https://github.com/gnu-mirror-unofficial/paxutils.git
+          git submodule update --init --recursive --depth 1
+        working-directory: tar.gnu
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get build-dep -y tar
+          sudo apt-get install -y autoconf automake autopoint bison gettext texinfo rsync jq
+
+      - name: Run GNU tests
+        shell: bash
+        run: |
+          cd tar
+          export CARGO_INCREMENTAL=0
+          bash util/build-gnu.sh || :
+
+      - name: Upload gnu-test-report
+        uses: actions/upload-artifact@v7
+        with:
+          name: gnu-test-report
+          path: tar.gnu/tests/testsuite.log
+
+      - name: Upload gnu-result
+        uses: actions/upload-artifact@v7
+        with:
+          name: gnu-result
+          path: gnu-result.json
+
+      - name: Download baseline from main (if available)
+        uses: actions/github-script@v8
+        id: download-baseline
+        continue-on-error: true
+        with:
+          script: |
+            let fs = require('fs');
+            fs.mkdirSync('${{ github.workspace }}/dl', { recursive: true });
+
+            // Find the latest successful workflow run on main
+            let runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'compat.yml',
+              branch: 'main',
+              status: 'success',
+              per_page: 1,
+            });
+
+            if (runs.data.workflow_runs.length === 0) {
+              core.info('No previous successful run on main found; skipping comparison.');
+              core.setOutput('has_baseline', 'false');
+              return;
+            }
+
+            let run_id = runs.data.workflow_runs[0].id;
+
+            let artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run_id,
+            });
+
+            let resultArtifact = artifacts.data.artifacts.find(a => a.name === 'gnu-result');
+            if (!resultArtifact) {
+              core.info('No gnu-result artifact found on main; skipping comparison.');
+              core.setOutput('has_baseline', 'false');
+              return;
+            }
+
+            let download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: resultArtifact.id,
+              archive_format: 'zip',
+            });
+
+            fs.writeFileSync('${{ github.workspace }}/dl/gnu-result.zip', Buffer.from(download.data));
+
+            let reportArtifact = artifacts.data.artifacts.find(a => a.name === 'gnu-test-report');
+            if (reportArtifact) {
+              let dlReport = await github.rest.actions.downloadArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: reportArtifact.id,
+                archive_format: 'zip',
+              });
+              fs.writeFileSync('${{ github.workspace }}/dl/gnu-test-report.zip', Buffer.from(dlReport.data));
+            }
+
+            core.setOutput('has_baseline', 'true');
+
+      - name: Compare failing tests against main
+        if: steps.download-baseline.outputs.has_baseline == 'true'
+        shell: bash
+        run: |
+          unzip -o dl/gnu-test-report.zip -d dl/ || true
+          bash tar/util/diff-gnu.sh dl/testsuite.log tar.gnu/tests/testsuite.log
+
+      - name: Compare result counts against main
+        if: steps.download-baseline.outputs.has_baseline == 'true'
+        shell: bash
+        run: |
+          unzip -o dl/gnu-result.zip -d dl/
+          cp dl/gnu-result.json latest-gnu-result.json
+          python3 tar/util/compare_gnu_result.py
